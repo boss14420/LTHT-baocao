@@ -1,3 +1,34 @@
+# Log-structure file system (LFS)
+
+Trong các hệ thống file ghi nhật ký (journaling file system), trước khi thực
+hiện một thay đổi, một tóm tắt về thao tác đó luôn được ghi vào log, vốn
+được lưu trong đĩa hoặc bộ nhớ NVRAM. Tóm tắt này (log record) chứa thông tin
+để thực hiện lại toàn bộ các thao tác nếu như việc ghi sau đó bị hỏng giữa
+chừng. Thao tác này gọi là `replay`. Như vậy, về cơ bản mọi thay đổi trong hệ
+thống file ghi nhật kí đều được ghi 2 lần: một lần vào log, và một lần ghi
+thật.
+
+Johm K. Ousterhout và các cộng sự nhận thấy rằng có thể bỏ qua lần ghi thứ hai
+nếu coi hệ thống file như là một log lơn. Như vậy thay vì ghi tóm tắt vào log
+và ghi thực sự vào đĩa, ta chỉ cần phải ghi một lần vào log. Thao tác ghi (đè)
+một file và inode là `copy-on-write`: phiên bản cũ được đánh dấu là vùng tự do,
+và phiên bản mới được ghi vào cuối log. Như vậy, tìm trạng thái hiện tại của
+hệ thống file tương đương với việc `replay` log từ đầu đến cuối. Trong thực tế,
+LFS ghi `checkpoint` vào đĩa thường xuyên, checkpoint mô tả trạng thái của hệ
+thống file tại thời điểm ghi mà không cần phải `replay` log. Mọi thay đổi của
+hệ thống file kể sau đó có thể khôi phục bằng cách replay một số lượng
+nhỏ log tính từ checkpoint đó.
+
+Một trong những lợi ích của LFS là các thao tác ghi là tuần tự. Việc này rất
+có ích cho bộ nhớ NAND flash. Với NAND flash, các thao tác ghi cần qua nhiều
+bước: đầu tiên xóa toàn bộ block (mỗi block của NAND flash chiếm khoảng 2MiB)
+tức là toàn bộ các bit được đưa về giá trị 1, sau đó mới ghi nội dung tương ứng
+vào. Vì chi phi cho việc xóa là lớn (phải xóa theo từng block 2MiB) nên nếu hệ
+thống file hoạt động theo kiểu ghi rải rác từng phần nhỏ kích thước vài KiB đến
+vào chục KiB sẽ tốn rất nhiều lần xóa và ghi các block (chưa kể để chi phí để
+di chuyển phần dữ liệu hợp lệ trong các block sẽ bị xóa). Nếu ghi tuần tự với
+một lượng lớn thì số lần xóa sẽ giảm đi (giảm `write-amplification`).
+
 # Hệ thống file F2FS
 
 f2fs (flash-friendly file system) là một hệ thống file mới dành cho Linux, dành
@@ -6,6 +37,8 @@ như jffs2, logfs vốn dành cho “*raw flash*”, f2fs dành cho các phần 
 SSDs, eMMC, SD card và những thiết bị nhớ flash có `FTL` (Flash translation
 layer). Trong quá trình hoạt động, f2fs sẽ để một phần công việc cho FTL thay
 vì tự làm từ đầu.
+
+F2FS được thiết kế dựa trên LFS, vốn thích hợp cho bộ nhớ flash.
 
 Lý do mà f2fs được gọi là “*flash friendly*” là vì:
 
@@ -180,4 +213,44 @@ thì chỉ có một block cần phải cập nhật. Ngoài ra vì các `dentry
 bị di chuyển, offset của nó không bao giờ thay đổi, do đó địa chỉ trả về bởi
 `telldir()` là ổn định.
 
+## Superblock, checkpoint và các siêu dữ liệu khác
+![metadata](figures/f2fsmetadata.png)
 
+F2fs cũng có `superblock` như nhiều hệ thống file khác, nhưng điểm khác biệt là
+superblock của f2fs không thay đổi nội dung từ lúc phân vùng được tạo. Nó chứa
+thông tin về kích thước phân vùng, kích thước mỗi segment, section, zone, không
+gian bộ nhớ dành cho các siêu dữ liệu (metadata) khác.
+
+Những thông tin như không gian còn trống, địa chỉ của segment tiếp theo sẽ được
+ghi, và những thông tin có thay đổi được (volatile) khác được lưu trong
+`checkpoint`. Vì f2fs là hệ thống file copy-on-write, có 2 segment liên tiếp
+nhau trong hệ thống đều lưu checkpoint, trong đó chỉ có một là checkpoint hiện
+tại hợp lệ. Các checkpoint được chứa số phiên bản, khi mount, checkpoint nào có số phiên
+bản lớn hơn sẽ là checkpoint hiện tại.
+
+Ngoài SSA và NAT đã đề cập đến ở các phần trước, trong metadata của f2fs còn
+chứa một phần gọi là *SIT* (*Segment Info Table*).
+
+SIT chứa thông tin về số lượng block hợp lệ (có thể ghi được) và bitmap về tính
+hợp lệ cho tất cả các block của một segment.
+
+Những thành phần như checkpoint, SIT, NAT, SSA đều được căn chỉnh (*align*)
+theo kích thước của một segment.
+
+Khi cần cập nhật NAT hoặc SIT, f2fs không cập nhật ngay, mà lưu vào bộ nhớ cho
+đến khi checkpoint tiếp theo được ghi ... (còn tiếp)
+
+## Cleaning (dọn dẹp)
+
+Hệ thống file LFS sau một thời gian hoạt động sẽ bị “phân mảnh”: các segment
+bị xóa xen lẫn với các segment chứa các dữ liệu hợp lệ do việc ghi trong LFS
+là copy-on-write. Để có các không gian trống lớn để thích hợp cho việc ghi tuần
+tự sau này thì cần phải thường xuyên dọn dẹp (cleaning).
+
+F2fs thực hiện việc dọn dẹp khi có yêu cầu và chạy nền. Khi không có đủ segment
+trống cho việc thực hiện các lời gọi VFS, sẽ có yêu cầu dọn dẹp. Việc chạy nền
+được thực hiện bởi một kernel thread, khi hệ thống rỗi (idle).
+
+F2fs sử dụng hai thuật toán: tham lam (gready) và cost-benefit. Trong thuật
+toán tham lam, f2fs chọn segment có ít block hợp lệ nhất. Trong thuật toán
+cost-benefit, f2fs chọn segment theo thời gian và cả số block hợp lệ.
